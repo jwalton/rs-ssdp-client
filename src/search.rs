@@ -7,6 +7,17 @@ use tokio::net::UdpSocket;
 
 const INSUFFICIENT_BUFFER_MSG: &str = "buffer size too small, udp packets lost";
 const DEFAULT_SEARCH_TTL: u32 = 2;
+const DEFAULT_SEARCH_TARGET: SearchTarget = SearchTarget::All;
+
+/// Used to construct a SSDP search request with options.
+#[derive(Debug)]
+pub struct SearchBuilder<'a> {
+    search_target: &'a SearchTarget,
+    timeout: Duration,
+    mx: usize,
+    ttl: Option<u32>,
+    bind_address: Option<SocketAddr>,
+}
 
 #[derive(Debug)]
 /// Response given by ssdp control point
@@ -54,6 +65,84 @@ async fn get_bind_addr() -> Result<SocketAddr, std::io::Error> {
     Ok(bind_addr)
 }
 
+impl<'a> SearchBuilder<'a> {
+    /// Create a new search builder
+    pub fn new() -> Self {
+        Self {
+            search_target: &DEFAULT_SEARCH_TARGET,
+            timeout: Duration::from_secs(5),
+            mx: 4,
+            ttl: None,
+            bind_address: None,
+        }
+    }
+
+    /// Set the search target. If none is provided, defaults to SearchTarget::All.
+    pub fn search_target(mut self, search_target: &'a SearchTarget) -> Self {
+        self.search_target = search_target;
+        self
+    }
+
+    /// Set the timeout for the search. Defaults to 5 seconds. This should be set
+    /// higher than the mx value.
+    pub fn timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = timeout;
+        self
+    }
+
+    /// Set the maximum wait time for responses. Defaults to 4 seconds.
+    pub fn mx(mut self, mx: usize) -> Self {
+        self.mx = mx;
+        self
+    }
+
+    /// Set the time-to-live value of outgoing multicast packets. Defaults to 2.
+    pub fn ttl(mut self, ttl: u32) -> Self {
+        self.ttl = Some(ttl);
+        self
+    }
+
+    /// Set the bind address for the search. If none is provided, the search will
+    /// try to bind to 0.0.0.0 on Unix-like systems or try to detect the interface
+    /// to use on Windows systems.  Use `0` for the port to pick a free port.
+    pub fn bind_address(mut self, bind_address: SocketAddr) -> Self {
+        self.bind_address = Some(bind_address);
+        self
+    }
+
+    /// Perform the search
+    pub async fn search(self) -> Result<impl Stream<Item = Result<SearchResponse, Error>>, Error> {
+        let bind_address = match self.bind_address {
+            Some(addr) => addr,
+            None => get_bind_addr().await?,
+        };
+        let broadcast_address: SocketAddr = ([239, 255, 255, 250], 1900).into();
+
+        let socket = UdpSocket::bind(&bind_address).await?;
+        socket
+            .set_multicast_ttl_v4(self.ttl.unwrap_or(DEFAULT_SEARCH_TTL))
+            .ok();
+
+        let msg = format!(
+            "M-SEARCH * HTTP/1.1\r
+Host:239.255.255.250:1900\r
+Man:\"ssdp:discover\"\r
+ST: {}\r
+MX: {}\r\n\r\n",
+            self.search_target, self.mx
+        );
+        socket.send_to(msg.as_bytes(), &broadcast_address).await?;
+
+        Ok(Gen::new(move |co| socket_stream(socket, self.timeout, co)))
+    }
+}
+
+impl Default for SearchBuilder<'_> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Search for SSDP control points within a network.
 /// Control Points will wait a random amount of time between 0 and mx seconds before responing to avoid flooding the requester with responses.
 /// Therefore, the timeout should be at least mx seconds.
@@ -63,25 +152,12 @@ pub async fn search(
     mx: usize,
     ttl: Option<u32>,
 ) -> Result<impl Stream<Item = Result<SearchResponse, Error>>, Error> {
-    let bind_addr: SocketAddr = get_bind_addr().await?;
-    let broadcast_address: SocketAddr = ([239, 255, 255, 250], 1900).into();
-
-    let socket = UdpSocket::bind(&bind_addr).await?;
-    socket
-        .set_multicast_ttl_v4(ttl.unwrap_or(DEFAULT_SEARCH_TTL))
-        .ok();
-
-    let msg = format!(
-        "M-SEARCH * HTTP/1.1\r
-Host:239.255.255.250:1900\r
-Man:\"ssdp:discover\"\r
-ST: {}\r
-MX: {}\r\n\r\n",
-        search_target, mx
-    );
-    socket.send_to(msg.as_bytes(), &broadcast_address).await?;
-
-    Ok(Gen::new(move |co| socket_stream(socket, timeout, co)))
+    SearchBuilder::new()
+        .search_target(search_target)
+        .timeout(timeout)
+        .mx(mx)
+        .ttl(ttl.unwrap_or(DEFAULT_SEARCH_TTL))
+        .search().await
 }
 
 macro_rules! yield_try {
@@ -106,7 +182,7 @@ async fn socket_stream(
         let text = match tokio::time::timeout(timeout, socket.recv(&mut buf)).await {
             Err(_) => break,
             Ok(res) => match res {
-                Ok(read) if read == 2048 => {
+                Ok(2048) => {
                     log::warn!("{}", INSUFFICIENT_BUFFER_MSG);
                     continue;
                 }
